@@ -1,0 +1,83 @@
+# TinyWebUI, development image.
+#
+#   docker build -f Dockerfile.dev -t tinywebui:dev .
+#   docker compose -f compose.dev.yaml up --build      # the intended path
+#
+# How this differs from the production image (Dockerfile):
+#
+#   * devDependencies are installed, so `npm test` and `npm run typecheck` run
+#     here -- the same commands as on the host.
+#   * compose.dev.yaml bind-mounts ./src ./bin ./public ./test over what is
+#     copied in below, and the process watches src/ and bin/ and restarts
+#     itself, so an edit is live with no rebuild. public/ is read per request
+#     and config.json/mcp.json hot-reload inside the process, so neither needs
+#     the watcher.
+#   * no embedding model is baked in (that is a ~90 MB download at build time).
+#     Search runs lexical; see docs/docker.md for hybrid in the dev loop.
+#   * uv is installed, so the two default MCP servers (TinySearch, TinyContext,
+#     started as `uvx --from tinysuite-search[server]`) come up the way they do
+#     on a real install. The production images ship neither uv nor npm on
+#     purpose -- see the note in README.md.
+#
+# The code is copied in as well as mounted, so `docker run tinywebui:dev` works
+# without compose; the mounts only shadow it during development.
+
+ARG NODE_IMAGE=node:22.23.3-slim
+ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.13.7
+
+# Official uv image: a pinned copy of the two binaries, rather than piping
+# astral.sh's installer into a shell at build time.
+FROM ${UV_IMAGE} AS uv
+
+FROM ${NODE_IMAGE}
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+# uv installs its own Python on demand; nothing else here needs it.
+ENV UV_LINK_MODE=copy \
+    UV_PYTHON_PREFERENCE=only-managed
+
+WORKDIR /app
+
+# Full dependency set. --ignore-scripts skips onnxruntime-node's postinstall,
+# which fetches GPU runtimes this image does not use; the CPU build ships in
+# the package. The production image does the same.
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
+
+ENV NODE_ENV=development \
+    TINYWEBUI_CONFIG=/data/tinywebui.config.json \
+    ORT_DISABLE_TELEMETRY=1
+# Deliberately not set here: TINYWEBUI_DB and TINYWEBUI_RETRIEVAL_MODE. Both
+# outrank the config file (dbPath and retrieval.mode are read from the
+# environment first), so baking them in would override what a test, a compose
+# service or a mounted config.json asked for. The database lands beside the
+# config -- /data/tinywebui.db -- and retrieval.mode comes from compose.dev.yaml.
+
+COPY tsconfig.json tsconfig.build.json ./
+# The checked-in config schema, because a test asserts it matches the code.
+COPY docs/config.schema.json ./docs/config.schema.json
+COPY bin ./bin
+COPY src ./src
+COPY public ./public
+# So `docker compose -f compose.dev.yaml run --rm tinywebui npm test` is the
+# same command, and the same tests, as on the host.
+COPY test ./test
+COPY test-fixtures ./test-fixtures
+COPY evals ./evals
+
+# /data holds accounts, chats, config, secrets and mcp.json -- and the
+# embedding bundles `tinywebui models pull` writes, which sit beside the config.
+RUN mkdir -p /data && chown node:node /data
+
+USER node
+VOLUME ["/data"]
+EXPOSE 7777
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s \
+  CMD node -e "fetch('http://127.0.0.1:7777/readyz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+
+# Not `npm run dev`: its predev step pulls the embedding model, which this image
+# deliberately does not have. 0.0.0.0 is what the container needs; authMode
+# 'multiuser' (the default) is what makes that safe -- 'local' refuses to bind
+# off loopback by design.
+CMD ["node", "--watch-path=./src", "--watch-path=./bin", "bin/tinywebui.ts", "start", "--host", "0.0.0.0", "--port", "7777"]

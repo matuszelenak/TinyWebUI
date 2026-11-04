@@ -131,6 +131,25 @@ The server is TypeScript that Node runs directly, with no build step, so working
 
 [AGENTS.md](AGENTS.md) maps the codebase and says where new code goes. `npm run eval` runs model-behaviour evals from `evals/tasks/` and makes real API calls, so it costs money.
 
+## Container images (this fork)
+
+`matuszelenak/TinyWebUI` adds a development image and a CI for the production
+ones on top of upstream. Upstream publishes to npm only; this fork also builds
+and pushes `ghcr.io/matuszelenak/tinywebui` with provenance and an SBOM, and
+runs `scripts/smoke-image.sh` against the digest it published before calling the
+build good.
+
+```sh
+make            # list the targets
+make dev        # development stack: source bind-mounted, restarts on change
+make dev-test   # the test suite, in the dev image
+make build      # hybrid, lexical and dev images tagged local
+make smoke      # boot the built image and check it actually serves
+```
+
+See [docs/docker.md](docs/docker.md) for the three images, the dev loop, what CI
+publishes, and how to pin a digest when deploying.
+
 ## License
 
 [GNU Affero General Public License v3.0 or later](LICENSE). If you run a modified version for users over a network, you must offer them the corresponding source code for that version.
