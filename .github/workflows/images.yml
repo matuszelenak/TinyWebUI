@@ -1,0 +1,171 @@
+name: images
+
+# Builds the container images and, on a branch or a tag, publishes them to
+# GHCR. Nothing here publishes to npm -- that is publish.yml, which is the
+# upstream release path; this workflow only adds the images upstream does not
+# build.
+#
+#   pull request  builds linux/amd64 into the runner's daemon, no push, and
+#                 boots it and probes it (see "Boot the image and probe it")
+#   main          pushes linux/amd64 + linux/arm64 tagged `main` and `sha-<rev>`
+#   v* tag        pushes the same, tagged `<version>`, `<major>.<minor>`,
+#                 `sha-<rev>` and `latest`
+#
+# Every variant gets a `-lexical` suffix for the smaller image (Dockerfile.lexical);
+# the unsuffixed tags are the default hybrid image (Dockerfile). Both carry a
+# build provenance attestation and an SBOM, so a digest can be traced back to the
+# commit and the runner that built it.
+#
+# Pin something by digest, not by tag:
+#   ghcr.io/<owner>/tinywebui@sha256:...        # `sha-<rev>` tags are immutable too
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  # For the provenance/SBOM attestations: keyless, signed with the run's OIDC
+  # identity, so nothing long-lived is stored.
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  # The registry rejects uppercase in a path, and github.repository keeps the
+  # owner's casing; repository_owner is enough here because the image name is
+  # fixed rather than derived from the fully-qualified repo.
+  IMAGE: ${{ github.repository_owner }}/tinywebui
+
+jobs:
+  build:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    # The arm64 leg builds under emulation, and the hybrid image downloads its
+    # embedding model during the build. Slow the first time, cached after.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: hybrid
+            dockerfile: Dockerfile
+            suffix: ''
+          - variant: lexical
+            dockerfile: Dockerfile.lexical
+            suffix: '-lexical'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        if: github.event_name != 'pull_request'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          # suffix appends to every tag, latest included: 0.1.8 -> 0.1.8-lexical
+          flavor: |
+            suffix=${{ matrix.suffix }}
+            onlatest=true
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          # A single-platform build can be loaded into the daemon and booted
+          # below; a multi-platform one can only be pushed.
+          platforms: ${{ github.event_name == 'pull_request' && 'linux/amd64' || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # An attestation is a manifest list, and the docker exporter that
+          # `load: true` needs cannot write one ("docker exporter does not
+          # currently support exporting manifest lists"), so on a pull request
+          # -- where the image is only loaded and booted -- they are off.
+          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}
+          sbom: ${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      # A green build only means the layers assembled. scripts/smoke-image.sh
+      # boots the image and checks it reaches its database, serves the page, and
+      # keeps its API closed to a caller with no session -- so a digest is only
+      # published after what it points at has been started once. The same script
+      # is `make smoke` locally.
+      - name: Boot the image and probe it
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Loaded into the daemon above, under the first tag metadata emitted
+            # (the -lexical variants carry that suffix, so take the real tag).
+            ref=$(printf '%s\n' '${{ steps.meta.outputs.tags }}' | head -n1)
+          else
+            # Verify the digest that was actually pushed, not a rebuild of it.
+            ref='${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.build.outputs.digest }}'
+            docker pull --platform linux/amd64 "$ref"
+          fi
+          ./scripts/smoke-image.sh "$ref"
+
+  # The development image is not published -- it is a build-time convenience --
+  # but it still has to build, or `docker compose -f compose.dev.yaml up` is
+  # broken without anyone noticing.
+  dev:
+    name: dev image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.dev
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: tinywebui:dev
+          cache-from: type=gha,scope=dev
+          cache-to: type=gha,mode=max,scope=dev
+
+      # The dev image is what runs the test suite in the dev loop, so make that
+      # work here rather than trusting it: the same probe, then `npm test`.
+      - name: Boot the dev image and run the test suite
+        run: |
+          ./scripts/smoke-image.sh tinywebui:dev
+          docker run --rm tinywebui:dev npm test

@@ -1,0 +1,54 @@
+# TinyWebUI, development stack: the source is bind-mounted and the process
+# restarts itself on a change, so there is no rebuild in the loop.
+#
+#   docker compose -f compose.dev.yaml up --build      # http://127.0.0.1:7777
+#   docker compose -f compose.dev.yaml run --rm tinywebui npm test
+#   docker compose -f compose.dev.yaml run --rm tinywebui npm run typecheck
+#   docker compose -f compose.dev.yaml exec tinywebui node bin/tinywebui.ts doctor
+#   docker compose -f compose.dev.yaml down           # keeps the data volume
+#   docker compose -f compose.dev.yaml down -v        # and the accounts with it
+#
+# The production stack is docker-compose.yml (builds ./Dockerfile) -- see
+# docs/docker.md for the four images and how CI publishes them.
+
+name: tinywebui-dev
+
+services:
+  tinywebui:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: tinywebui:dev
+    # PID 1 that reaps children: uvx starts TinySearch/TinyContext underneath.
+    init: true
+    ports:
+      - "127.0.0.1:${TINYWEBUI_DEV_PORT:-7777}:7777"
+    environment:
+      TINYWEBUI_LOG_LEVEL: ${TINYWEBUI_LOG_LEVEL:-debug}
+      # 'hybrid' needs an embedding bundle in ./models (see docs/docker.md);
+      # 'lexical' is FTS5 BM25 only and needs nothing.
+      TINYWEBUI_RETRIEVAL_MODE: ${TINYWEBUI_RETRIEVAL_MODE:-lexical}
+    volumes:
+      # The code. src/ and bin/ are watched (the process restarts on a change);
+      # public/ is read per request; config.json and mcp.json hot-reload in the
+      # process. node_modules and package.json stay in the image, so changing a
+      # dependency does need `--build`.
+      - ./src:/app/src:ro
+      - ./bin:/app/bin:ro
+      - ./public:/app/public:ro
+      - ./test:/app/test:ro
+      - ./test-fixtures:/app/test-fixtures:ro
+      - ./evals:/app/evals:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./tsconfig.build.json:/app/tsconfig.build.json:ro
+      # Accounts, chats, config, secrets and mcp.json: what /data is for. A
+      # named volume, so `down -v` is the only thing that throws it away.
+      - tinywebui-dev-data:/data
+      # Optional: an embedding bundle for hybrid search. It lives beside the
+      # config (/data/models is where `tinywebui models pull` writes by default),
+      # so a bundle pulled on the host is the one the container loads. Create
+      # the directory first (`make models`) so it is owned by you, not root.
+      - ./models:/data/models
+
+volumes:
+  tinywebui-dev-data:

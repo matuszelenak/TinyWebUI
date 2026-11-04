@@ -1,0 +1,40 @@
+# Build context for Dockerfile.dev. Deliberately not the shared .dockerignore:
+# the development image carries test/, test-fixtures/ and evals/ so the suite and
+# the evals run in the container, and it does not need the repo's docs/images.
+node_modules
+.git
+.github
+assets
+evals/results
+.playwright-mcp
+
+# docs/ is not needed except the config schema, which a test compares against
+# the code. Excluding the contents rather than the directory keeps the
+# re-include below working.
+docs/*
+!docs/config.schema.json
+
+models
+
+# Local state and local wiring -- the container's own lives in /data.
+.env
+.env.*
+*.db
+*.db-*
+tinywebui.config.js
+tinywebui.config.mjs
+tinywebui.config.json
+tinywebui.secrets.json
+mcp.json
+CLAUDE.md
+
+# Emitted beside the .ts sources by `npm run build`; the image runs the .ts.
+src/**/*.js
+bin/*.js
+
+# Build inputs that are read by the builder itself, not copied into the image.
+Dockerfile*
+.dockerignore
+compose*.yaml
+docker-compose.yml
+Makefile
